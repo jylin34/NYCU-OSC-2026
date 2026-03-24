@@ -16,7 +16,7 @@
 | Structure | 
 | ------ | 
 | FDT Header | 
-| Memory Reservation Block | 
+Memory Reservation Block | 
 | Structure Block | 
 | Strings Block |
 
