@@ -80,6 +80,27 @@ struct page* alloc_pages(unsigned int order) {
 void free_pages(struct page* page) {
     // TODO: Implement this function
     
+    // 1. 把當前這個 page refcount --
+    page -> refcount = 0;
+    int order = page -> order;
+
+    // 3. while loop if order < MAX_ORDER
+    while (order < MAX_ORDER) {
+        // 4. 檢查 buddy 只有物理位置相鄰 且大小相同的才能合併
+        struct page* buddy = get_buddy(page, order);
+        // 需要合併
+        if (buddy -> refcount == 0 && buddy -> order == order) { // 如果不判斷 order 呢？
+            free_area[order].remove(buddy);
+            page = (page < buddy) ? page : buddy;
+            order ++;
+        }
+        else { // 不用合併 代表已經完成
+            break;
+        }
+    }
+    page -> order = order;
+    free_area[order].push_back(page);
+    return;
 }
 
 void dump() {
