@@ -90,7 +90,7 @@ void free_pages(struct page* page) {
         struct page* buddy = get_buddy(page, order);
         // 需要合併
         if (buddy -> refcount == 0 && buddy -> order == order) { // 如果不判斷 order 呢？
-            free_area[order].remove(buddy);
+            free_area[order].remove(buddy); // O(n)
             page = (page < buddy) ? page : buddy;
             order ++;
         }
