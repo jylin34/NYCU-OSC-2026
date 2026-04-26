@@ -9,6 +9,8 @@ clear_bss:
     add a3, a3, 8
     blt a3, a4, clear_bss
 clear_bss_done:
+    // 把 handle_exception 放到 stvec
+    // 當 u-mode 發生 ecall 跳到 s-mode 就會來執行這個
     la a2, handle_exception
     csrw stvec, a2
     la sp, _end
@@ -16,17 +18,28 @@ clear_bss_done:
 
 .global handle_exception
 .align 2
+// start.S 一開始有把 handle_exception 放在 stvec
+// 放在 stvec 所以當 u-mode 發生 ecall 要跳到 s-mode 就會來執行這個
+
+// 不論 u -> s 或是 s -> s 都有可能執行 handle_exception
 handle_exception:
     /*
      * Retrieve kernel sp from sscratch and
      * save user sp to sscratch
      */
-    csrrw sp, sscratch, sp
+    // csrrw: 把 sscratch 跟 sp 的值互換
+    // 在 u-mode: sscratch 會儲存 kernel stack 的位址
+    // 在 s-mode: sscratch 會儲存 0
+    csrrw sp, sscratch, sp 
+    // sp != 0 會直接跳去執行 save_context
     bnez sp, save_context
-
+    
+    // csrr: 把 sscratch 的東西讀到 sp 
+    // 如果原本就在 s-mode 就會執行這一行
     csrr sp, sscratch
 save_context:
     /* Save context */
+    // 把 risc-v 裡面所有 32 個 registers 的內容都存起來
     addi sp, sp, -8 * 35
     sd ra,  8 *  0(sp)
     sd gp,  8 *  2(sp)
@@ -69,10 +82,15 @@ save_context:
     sd s3,  8 * 33(sp)
     sd s4,  8 * 34(sp)
 
+    // csrw: 把東西寫進 csr
+    // 把暫存器 zero 的內容，填進這個 sscratch 裡面。
     csrw sscratch, zero
     move a0, sp
+    // do_trap 位於 main.c 77 行
+    // 跟 tail 不一樣 call 會在執行完 do_trap 後，回到這邊繼續執行
     call do_trap
 
+// call do_trap ˊ執行完成後 會接續執行下面的 ret_from_exception
 ret_from_exception:
     ld s0,  8 * 32(sp)
     andi s0, s0, (1 << 8)

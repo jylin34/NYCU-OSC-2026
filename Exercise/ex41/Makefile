@@ -12,7 +12,7 @@ build: clean
 	$(OBJCOPY) -O binary $(TARGET).elf $(TARGET)
 
 run: build $(TARGET) initramfs.cpio
-	$(QEMU) -M virt -m 8G -kernel $(TARGET) -display none -serial stdio -initrd initramfs.cpio
+	$(QEMU) -M virt -m 256M -kernel $(TARGET) -display none -serial stdio -initrd initramfs.cpio
 
 clean:
 	rm -f $(TARGET) $(TARGET).elf *.o
