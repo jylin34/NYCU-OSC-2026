@@ -46,6 +46,7 @@ int exec(const char* filename) {
         
         if (!memcmp(p + sizeof(struct cpio_t), filename, namesize)) {
             unsigned long target_address = (unsigned long)(p + headsize);
+            // 配一塊 user stack
             void* user_stack = alloc_page();
             if (!user_stack) return -1;
 
@@ -58,11 +59,10 @@ int exec(const char* filename) {
             sstatus |= (1L << 5);  // 設定 SPIE 位元 (Bit 5)
 
             // 準備跳轉至 User mode
-            // sscratch 必須存入當前核心堆疊，以便下次進入 Trap 時切換回來
             asm volatile(
                 "csrw sepc, %0\n"
                 "csrw sstatus, %1\n"
-                "csrw sscratch, sp\n" 
+                "csrw sscratch, sp\n" // 存入現在 S-mode 的 kernel stack 位址, 下次切換回來 才知道在哪
                 "mv sp, %2\n"
                 "sret\n"
                 : : "r"(target_address), "r"(sstatus), "r"(user_sp)

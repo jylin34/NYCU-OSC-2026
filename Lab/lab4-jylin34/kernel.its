@@ -1,0 +1,46 @@
+/* 給 U-Boot 的 mkimage 工具使用的設定檔 
+   目的是將多個檔案打包成一個單一的檔案 
+   稱為 FIT Flattened Image Tree        */
+/dts-v1/;
+/ {
+    description = "U-boot FIT Image for Orange Pi RV2";
+    #address-cells = <2>;
+    images {
+        kernel { // 要包含 kernel binary file
+            description = "Kernel Image";
+            data = /incbin/("kernel");
+            type = "kernel";
+            arch = "riscv";
+            os = "linux";
+            compression = "none";
+            load = <0x0 0x00200000>; // 2MB
+            entry = <0x0 0x00200000>;
+        };
+        fdt { // 要包含 device tree 的 binary file (.dtb)
+            description = "Flat Device Tree";
+            data = /incbin/("x1_orangepi-rv2.dtb"); // 如果沒有 include qemu.dtb eqmu 還是可以跑 因為 qemu 內建會幫你自動 include
+            type = "flat_dt";
+            arch = "riscv";
+            compression = "none";
+            load = <0x0 0x31000000>;
+        };
+        ramdisk {
+             description = "Initial Ramdisk";
+             data = /incbin/("initramfs.cpio");
+             type = "ramdisk";
+             arch = "riscv";
+             os = "linux";
+             compression = "none";
+             load = <0x0 0x46100000>;
+         };
+    };
+    configurations {
+        default = "conf";
+        conf {
+            description = "NYCU OSC RISC-V KERNEL";
+            kernel = "kernel";
+            fdt = "fdt";
+            ramdisk = "ramdisk";
+        };
+    };
+};
