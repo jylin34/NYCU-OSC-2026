@@ -319,6 +319,191 @@ extern void memory_reserve(unsigned long base, unsigned long size);
 extern void buddy_test();
 extern void test_alloc_1();
 
+// =============================== Lab 4 debug Start =====================================
+
+extern struct page* alloc_pages(int order);
+extern struct page* mem_map;
+extern unsigned long buddy_memory_base;
+
+struct list_head {
+    struct list_head *next;
+    struct list_head *prev;
+};
+
+struct page {
+    struct list_head list;
+    int order;
+    int refcount;
+    int is_slab;
+    uint32_t slab_id;
+};
+
+struct pt_regs {
+    unsigned long ra;
+    unsigned long sp;
+    unsigned long gp;
+    unsigned long tp;
+    unsigned long t0;
+    unsigned long t1;
+    unsigned long t2;
+    unsigned long s0;
+    unsigned long s1;
+    unsigned long a0;
+    unsigned long a1;
+    unsigned long a2;
+    unsigned long a3;
+    unsigned long a4;
+    unsigned long a5;
+    unsigned long a6;
+    unsigned long a7;
+    unsigned long s2;
+    unsigned long s3;
+    unsigned long s4;
+    unsigned long s5;
+    unsigned long s6;
+    unsigned long s7;
+    unsigned long s8;
+    unsigned long s9;
+    unsigned long s10;
+    unsigned long s11;
+    unsigned long t3;
+    unsigned long t4;
+    unsigned long t5;
+    unsigned long t6;
+    unsigned long sepc;
+    unsigned long sstatus;
+    unsigned long scause;
+    unsigned long stval;
+};
+
+#define STACK_SIZE  0x1000
+
+/**
+ * @brief Convert a hexadecimal string to integer
+ */
+static int hextoi(const char* s, int n) { // cpio: n hex digits
+    int r = 0;
+    while (n-- > 0) {
+        r = r << 4;
+        if (*s >= 'A')
+            r += *s++ - 'A' + 10;
+        else if (*s >= '0')
+            r += *s++ - '0';
+        else
+            s++;
+    }
+    return r;
+}
+
+/**
+ * @brief Align a number to the nearest multiple of a given number
+ */
+static int align(int n, int byte) {
+    return (n + byte - 1) & ~(byte - 1);
+}
+
+struct cpio_t {
+    char magic[6];
+    char ino[8];
+    char mode[8];
+    char uid[8];
+    char gid[8];
+    char nlink[8];
+    char mtime[8];
+    char filesize[8];
+    char devmajor[8];
+    char devminor[8];
+    char rdevmajor[8];
+    char rdevminor[8];
+    char namesize[8];
+    char check[8];
+};
+
+int exec(const char *filename) {
+    if (!cpio_base) {
+        uart_puts("Error: initramfs not found in device tree.\n");
+        return -1;
+    }
+
+    const char *ptr = (const char *)cpio_base;
+    while (1) {
+        const struct cpio_t *header = (const struct cpio_t *)ptr;
+
+        if (strncmp(header->magic, "070701", 6) != 0) {
+            uart_puts("Error: Invalid initramfs format.\n");
+            return -1;
+        }
+
+        uint32_t namesize = (uint32_t)hextoi(header->namesize, 8);
+        uint32_t filesize = (uint32_t)hextoi(header->filesize, 8);
+        const char *cur_filename = ptr + sizeof(struct cpio_t);
+
+        if (!strcmp(cur_filename, "TRAILER!!!")) {
+            break;
+        }
+
+        uint32_t data_offset = (uint32_t)align(sizeof(struct cpio_t) + namesize, 4);
+        if (!strcmp(cur_filename, filename)) {
+            unsigned long target_address = (unsigned long)(ptr + data_offset);
+            struct page *user_stack_page = alloc_pages(0); // 分配 user stack, 一個 (2^0) page = 4KB
+            if (!user_stack_page) {
+                uart_puts("Error: failed to allocate user stack.\n");
+                return -1;
+            }
+
+            // 在 mem_map 裡面的第幾個 page * page 大小 (4096 Bytes)
+            unsigned long user_stack = buddy_memory_base + (unsigned long)(user_stack_page - mem_map) * 0x1000UL; 
+            unsigned long user_sp = user_stack + STACK_SIZE;
+            unsigned long sstatus;
+
+            // 從 CSR sstatus 讀出目前的值，存到 C 變數 sstatus。
+            asm volatile("csrr %0, sstatus" : "=r"(sstatus));
+            // 把 sstatus 第 8 bit 清成 0。 (bitwise NOT) 
+            // SPP = 0 代表 sret 後要回到 U-mode。
+            sstatus &= ~(1UL << 8);
+            // 把 sstatus 第 5 bit 設成 1。
+            // SPIE ?
+            sstatus |= (1UL << 5);
+
+            asm volatile(
+                "csrw sepc, %0\n"
+                "csrw sstatus, %1\n"
+                "csrw sscratch, sp\n" // 把目前 S-mode 的 stack pointer 存到 sscratch
+                "mv sp, %2\n"
+                "sret\n" // 跳進 U-mode (riscv 的 assembly 語法)
+                :
+                : "r"(target_address), "r"(sstatus), "r"(user_sp) // %0 %1 %2 
+                : "memory");
+
+            return 0;
+        }
+
+        ptr += align(data_offset + filesize, 4);
+    }
+
+    uart_puts("Error: program not found in initramfs.\n");
+    return -1;
+}
+
+void do_trap(struct pt_regs *regs) {
+    uart_puts("=== S-Mode trap ===\n");
+    uart_puts("scause: ");
+    uart_hex(regs->scause);
+    uart_puts("\n");
+    uart_puts("sepc: ");
+    uart_hex(regs->sepc);
+    uart_puts("\n");
+    uart_puts("stval: ");
+    uart_hex(regs->stval);
+    uart_puts("\n");
+
+    if (regs->scause == 8UL) {
+        regs->sepc += 4; // 這段是在處理「U-mode 的 ecall」後，避免無限重複 trap。
+    }
+}
+
+// =============================== Lab 4 debug End =====================================
+
 extern char _start[];
 extern char _image_end[];
 extern char _end[];
@@ -548,6 +733,21 @@ void start_kernel(unsigned long hartid) {
                 initrd_cat(cpio_base, buf + 4);
             } else {
                 uart_puts("Error: initramfs not found in device tree.\n");
+            }
+        }
+        else if (strncmp(buf, "exec ", 5) == 0) {
+            const char *filename = buf + 5;
+
+            while (*filename == ' ') {
+                filename++;
+            }
+
+            if (*filename == '\0') {
+                uart_puts("Error: missing program name.\n");
+            } else {
+                if (exec(filename) < 0) {
+                    uart_puts("Failed to exec user program.\n");
+                }
             }
         }
         else {
