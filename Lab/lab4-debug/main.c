@@ -485,7 +485,88 @@ int exec(const char *filename) {
     return -1;
 }
 
+// wrapper function to call sbi_ecall to trigger timer interrupt
+static inline void sbi_set_timer(unsigned long stime_value) { // 絕對值
+    /* SBI_EXT_SET_TIMER: 0 (set_timer), fid 0 (function id 0) */
+    sbi_ecall(SBI_EXT_SET_TIMER, 0, stime_value, 0, 0, 0, 0, 0);
+    // S-mode 的作業系統）透過 SBI（ecall）叫韌體（例如 OpenSBI）幫我把下一次
+    // 定時器事件設定到 stime_value，也就是請韌體把 CLINT 的 mtimecmp 設成 stime_value。
+}
+
+// static 只有當前檔案可以用的 function
+// inline 告訴編譯器「可把呼叫處展開成函式本體以省掉呼叫開銷（內聯）」。
+static inline unsigned long rdtime(void) {
+    unsigned long t;
+    asm volatile("rdtime %0" : "=r"(t));
+    return t;
+}
+
+static unsigned long ticks_per_sec = 24000000UL; // 硬編碼為 24000000 (DTB timebase-frequency) / qemu: 10000000UL
+static unsigned long boot_time = 0;
+
+static void timer_init(void) {
+    unsigned long now = rdtime();
+    unsigned long target = now + 2UL * ticks_per_sec; // 2 秒後
+    boot_time = now;
+
+    sbi_set_timer(target);
+
+    // 開 timer interrupt source: STIE (sie bit 5)
+    asm volatile("csrs sie, %0" :: "r"(1UL << 5));
+    // 開全域中斷: SIE (sstatus bit 1)
+    asm volatile("csrsi sstatus, (1 << 1)");
+}
+
 void do_trap(struct pt_regs *regs) {
+
+    unsigned long scause = regs->scause;
+    unsigned long is_interrupt = scause >> ((sizeof(unsigned long) * 8) - 1); // 8 * 8 - 1 = 63 為了兼容 rv32 rv64
+    // 取 scause 的 MSB, 代表 interrupt bit, 是 1 的話 代表是 interrupt, 是 0 的話代表是 exception
+    unsigned long cause_code = scause & 0xffUL; // 取 scause 的最低的 8 位
+    // 如果 cause_code = 5 就代表是 timer interrupt
+
+    if (is_interrupt && cause_code == 5UL) {// exercise 2: supervisor timer interrupt
+        unsigned long now = rdtime();
+        unsigned long seconds = 0;
+        char msg[32];
+        int pos = 0;
+
+        if (now >= boot_time) {
+            seconds = (now - boot_time) / ticks_per_sec;
+        }
+
+        while (pos < (int)(sizeof(msg) - 1) && "boot time: "[pos] != '\0') {
+            msg[pos] = "boot time: "[pos];
+            pos++;
+        }
+
+        if (seconds == 0) {
+            msg[pos++] = '0';
+        } else {
+            char digits[32];
+            int digit_count = 0;
+
+            while (seconds > 0 && digit_count < (int)sizeof(digits)) {
+                digits[digit_count++] = '0' + (seconds % 10);
+                seconds /= 10;
+            }
+
+            while (digit_count-- > 0 && pos < (int)(sizeof(msg) - 1)) {
+                msg[pos++] = digits[digit_count];
+            }
+        }
+
+        if (pos < (int)(sizeof(msg) - 1)) {
+            msg[pos++] = '\n';
+        }
+        msg[pos] = '\0';
+
+        uart_puts(msg);
+
+        sbi_set_timer(now + 2UL * ticks_per_sec);
+        return;
+    }
+
     uart_puts("=== S-Mode trap ===\n");
     uart_puts("scause: ");
     uart_hex(regs->scause);
@@ -563,6 +644,7 @@ void relocate_bootloader(unsigned long hartid) {
 void start_kernel(unsigned long hartid) {
     unsigned long boot_cpu_hartid = hartid;
     // relocate_bootloader(boot_cpu_hartid);
+    timer_init();
     devicetree_early_init(fdt_ptr);
     
     // 啟動記憶體管理系統 (mm_init)
