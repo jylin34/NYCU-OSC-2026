@@ -22,6 +22,9 @@ SECTIONS
         __bss_stop = .; 
     }
 
+    . = ALIGN(8); 
+    _image_end = .; /* _image_end 指向目前的位址 也就是 kernel image 的結尾 不用複製 stack */
+
     /* 這個函式會計算出大於或等於目前位址 且可以被 16 整除的最小位址 */
     . = ALIGN(16); /* RISC-V 規定 stack pointer 必須保持和 16-bytes 對齊 */
 

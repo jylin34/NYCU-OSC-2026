@@ -158,7 +158,58 @@ void devicetree_early_init(void *fdt) {
     }
 }
 
-void start_kernel() {
+extern char _start[];
+extern char _image_end[];
+extern char _end[];
+
+void start_kernel(unsigned long hartid);
+
+// Lab2: advance - Bootloader Self-Relocation
+// 0x00200000 -> 0x20000000
+void relocate_bootloader(unsigned long hartid) {
+    unsigned long target_addr = 0x20000000;
+
+    // 1. 取得「當前真正在執行的實體位址 (PC)」
+    // auipc 配合 0，可以把當前這行指令的絕對位址存進 current_pc 變數
+    unsigned long current_pc;
+    asm volatile("auipc %0, 0" : "=r"(current_pc));
+
+    // 2. 判斷我們是否已經在「新家」
+    // 如果 PC 已經大於等於 0x20000000，代表我們已經跳轉過了！
+    if (current_pc >= target_addr) {
+        return; // 這裡的 return，會回到「新家」的 start_kernel 繼續往下執行！
+    }
+
+    // 3. 開始搬家 (從 Linker 規定的起點搬)
+    unsigned long size = (unsigned long)_image_end - (unsigned long)_start;
+    unsigned long *src = (unsigned long *)_start;
+    unsigned long *dst = (unsigned long *)target_addr;
+    
+    for (unsigned long i = 0; i < size / 8; i++) {
+        dst[i] = src[i];
+    }
+
+    // 4. 計算接下來要跳轉的「新 start_kernel」位址與「新 Stack」
+    unsigned long offset = target_addr - (unsigned long)_start;
+    unsigned long new_start_kernel = (unsigned long)&start_kernel + offset;
+    unsigned long new_sp = (unsigned long)_end + offset;
+
+    // 5. 信仰之躍！切換 Stack，並「重新呼叫」新家的 start_kernel
+    asm volatile(
+        "mv a0, %0\n"       // 帶上 hartid
+        "mv sp, %1\n"       // 切換到新家的 Stack
+        "jr %2\n"           // 跳轉到新家的 start_kernel 起點
+        :
+        : "r"(hartid), "r"(new_sp), "r"(new_start_kernel)
+        : "a0", "memory"
+    );
+
+    while(1); // 永遠不會執行到這
+}
+
+void start_kernel(unsigned long hartid) {
+    unsigned long boot_cpu_hartid = hartid;
+    relocate_bootloader(boot_cpu_hartid);
     devicetree_early_init(fdt_ptr);
 
     uart_puts("\nStarting kernel ...\n");
@@ -209,7 +260,7 @@ void start_kernel() {
             uart_puts("load    : load kernel image from host computer\n");
             uart_puts("ls      : list files in initramfs\n");
             uart_puts("cat     : display file content in initramfs\n");
-            uart_puts("This is the transferred kernel!\n20260326\n");
+            uart_puts("This is the transferred kernel!\n20260508 haha\n");
         } 
         else if (strcmp(buf, "hello") == 0) {
             uart_puts("Hello World!\n");
@@ -234,7 +285,7 @@ void start_kernel() {
             uint32_t size = 0; 
             // QEMU: 0x82000000
             // OrangePi: 0x20000000
-            uint8_t * load_ptr = (uint8_t *)0x20000000; 
+            uint8_t * load_ptr = (uint8_t *)0x00200000; 
             
             for (uint8_t i = 0; i < 4; i ++) { 
                 ((char *)&magic)[i] = uart_getc();
@@ -259,9 +310,9 @@ void start_kernel() {
                 }
             
                 // 定義 kernel_entry pointer 並且指向 0x20000000
-                void (*kernel_entry)(unsigned long, void *) = (void (*)(unsigned long, void *))0x20000000;
+                void (*kernel_entry)(unsigned long, void *) = (void (*)(unsigned long, void *))0x00200000;
                 // 呼叫 kernel_entry CPU 會把 Program Counter 指向那個位址，並傳遞 FDT 指標 (a1)
-                uart_puts("Set program counter to 0x20000000 and passing FDT pointer...\n");
+                uart_puts("Set program counter to 0x00200000 and passing FDT pointer...\n");
                 kernel_entry(0, fdt_ptr);
                 // 傳入的參數分別代表 a0(Hardware Thread ID) / a1(file device tree)
                 // ，Hart ID 就是每個 CPU 核心專屬的「員工編號」，用來讓系統在開機時辨認現在是哪一個硬體工人在幹活。
