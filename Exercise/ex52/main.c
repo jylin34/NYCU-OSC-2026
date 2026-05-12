@@ -7,7 +7,19 @@ extern void video_bmp_display(unsigned int* bmp_image, int width, int height);
 
 #define TIME_FREQ 10000000
 int usleep(unsigned int usec) {
-    // TODO: Implement this function
+    unsigned long start, now;
+    
+    // 取得當前的硬體時間 (ticks)
+    asm volatile("rdtime %0" : "=r"(start));
+    
+    // 計算目標時間：1us 對應 10 個 tick (10,000,000 / 1,000,000)
+    unsigned long ticks = (unsigned long)usec * 10;
+    
+    do {
+        asm volatile("rdtime %0" : "=r"(now));
+    } while ((now - start) < ticks);
+    
+    return 0; // 補上 return 0 解決編譯警告
 }
 
 void display_video() {
@@ -24,5 +36,6 @@ void display_video() {
 void start_kernel() {
     uart_puts("\nStarting kernel ...\n");
     // TODO: Initialize the QEMU frame buffer device
+    video_init();
     display_video();
 }

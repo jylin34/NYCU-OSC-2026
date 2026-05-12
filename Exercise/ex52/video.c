@@ -5,7 +5,7 @@
 extern int strncmp(const char* s1, const char* s2, int n);
 extern void* memcpy(void* dst, const void* src, int n);
 
-#define FB_BASE   0xfe000000
+#define FB_BASE   0x87000000
 #define FB_WIDTH  1920
 #define FB_HEIGHT 1080
 #define FB_BPP    4
@@ -93,15 +93,14 @@ static int fw_cfg_find_file(const char* name) {
 }
 
 #define CACHE_BLOCK_SIZE 64
-#define cbo_flush(start)                            \
-    ({                                              \
-        unsigned long __v = (unsigned long)(start); \
-        __asm__ __volatile__(                       \
-            "cbo.flush"                             \
-            " 0(%0)"                                \
-            :                                       \
-            : "rK"(__v)                             \
-            : "memory");                            \
+// 將原本的 cbo_flush 替換掉
+#define cbo_flush(start)                \
+    ({                                  \
+        asm volatile("mv a0, %0\n\t"    \
+                     ".word 0x0025200F" \
+                     :                  \
+                     : "r"(start)       \
+                     : "memory", "a0"); \
     })
 
 static void flush_dcache(void* addr, unsigned long len) {
@@ -134,6 +133,6 @@ void video_bmp_display(unsigned int* bmp_image, int width, int height) {
     for (int y = 0; y < height; y++) {
         void* dst = fb + (start_y + y) * FB_WIDTH + start_x;
         memcpy(dst, bmp_image + y * width, width * sizeof(unsigned int));
-        flush_dcache(dst, width * sizeof(unsigned int));
+        // flush_dcache(dst, width * sizeof(unsigned int));
     }
 }

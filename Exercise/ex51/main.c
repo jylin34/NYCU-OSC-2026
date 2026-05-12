@@ -7,6 +7,12 @@ extern void* alloc_page();
 
 #define STACK_SIZE 0x1000
 
+enum task_state {
+    TASK_RUNNING,
+    TASK_RUNNABLE,
+    TASK_ZOMBIE
+};
+
 struct task_struct {
     struct thread_struct {
         unsigned long ra;
@@ -14,6 +20,7 @@ struct task_struct {
         unsigned long s[12];
     } thread;
     int pid;
+    enum task_state state;
     unsigned long kernel_sp;
     unsigned long user_sp;
     unsigned long stack;
@@ -22,6 +29,27 @@ struct task_struct {
 
 static int nr_threads = 0;
 static struct task_struct* run_queue = 0;
+static struct task_struct* zombie_queue = 0;
+
+struct task_struct* kthread_create(void (*threadfn)()) {
+    struct task_struct* task = kmalloc(sizeof(struct task_struct));
+    task->pid = nr_threads++;
+    task->stack = (unsigned long)alloc_page();
+    task->thread.ra = (unsigned long)threadfn;
+    task->thread.sp = task->stack + STACK_SIZE;
+    enqueue(&run_queue, task);
+    return task;
+}
+
+void thread_exit() {
+    struct task_struct* prev = get_current();
+
+    current->state = TASK_ZOMBIE;
+
+    enqueue(&zombie_queue, current);
+
+    schedule();
+}
 
 static void enqueue(struct task_struct** queue, struct task_struct* task) {
     if (*queue == 0) {
@@ -42,12 +70,31 @@ struct task_struct* get_current() {
 extern void switch_to(struct task_struct* prev, struct task_struct* next);
 
 void schedule() {
-    // TODO: Implement this function
+    struct task_struct* prev = get_current();
+    struct task_struct* next;
+
+    next = run_queue;
+    run_queue = run_queue->next;
+
+    if (prev->state == TASK_RUNNING) {
+        prev->state = TASK_RUNNABLE;
+        enqueue(&run_queue, prev);
+    }
+
+    next->state = TASK_RUNNING;
+
+    if (prev != next) {
+        switch_to(prev, next);
+    }
+}
+
+void kill_zombies() {
+    // TODO
 }
 
 void idle() {
     while (1) {
-        // kill_zombies();
+        kill_zombies();
         schedule();
     }
 }
@@ -65,16 +112,6 @@ void foo() {
     }
     while (1)
         ;
-}
-
-struct task_struct* kthread_create(void (*threadfn)()) {
-    struct task_struct* task = kmalloc(sizeof(struct task_struct));
-    task->pid = nr_threads++;
-    task->stack = (unsigned long)alloc_page();
-    task->thread.ra = (unsigned long)threadfn;
-    task->thread.sp = task->stack + STACK_SIZE;
-    enqueue(&run_queue, task);
-    return task;
 }
 
 void start_kernel() {
