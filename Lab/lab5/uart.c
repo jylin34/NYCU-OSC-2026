@@ -18,7 +18,7 @@ unsigned long UART_LSR_OFFSET = 0x14;  // Default for OrangePi RV2
 /* Interrupt Enable Register (16550 compatible) */
 // SOC manual 16.3.4.5 Interrupt Enable Register
 // qemu: 0x1 / orangepi: 0x4
-#define UART_IER  ((volatile unsigned int*)(UART_BASE + 0x1))
+#define UART_IER  ((volatile unsigned int*)(UART_BASE + 0x4))
 
 #define RING_BUF_SIZE 256
 
@@ -244,9 +244,12 @@ void uart_polling_putc(char c) {
 }
 // ======================================== Polling debug ========================================
 
+extern void schedule(void);
+
 char uart_getc() {
-    while ((*UART_LSR & LSR_DR) == 0)
-        ;
+    while ((*UART_LSR & LSR_DR) == 0) {
+        schedule();
+    }
     char c = (char)*UART_RBR;
     return c == '\r' ? '\n' : c;
 

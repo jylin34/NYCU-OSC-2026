@@ -11,7 +11,7 @@ SECTIONS
     /* 通常會先運行 OpenSBI 韌體 他會佔用一小部分的空間 */
     /* 等 OpenSBI 初始化完成後，他會跳轉到 0x80200000 來啟動 Kernel */
     /* QEMU: 0x80200000 / OrangePi: 0x00200000 */
-    . = 0x80200000; /* 2MB */
+    . = 0x00200000; /* 2MB */
     /* 如果要 load 的話改成 0x20000000 */
     _start = .;
     .text : { *(.text.boot) *(.text) }

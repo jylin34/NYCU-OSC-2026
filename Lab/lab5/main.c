@@ -26,13 +26,18 @@ extern void uart_plic_handle_interrupt(void);
 extern unsigned long UART_BASE;
 extern unsigned long UART_LSR_OFFSET;
 unsigned long boot_cpu_hartid = 0;
-unsigned long PLIC_BASE = 0xc000000UL; /* default for QEMU; will be overwritten by FDT */
+unsigned long PLIC_BASE = 0xE0000000UL; /* default for QEMU; will be overwritten by FDT */
 // Qemu: 0xc000000 Orangepi: 0xE0000000 ?
-unsigned long UART_PLIC_IRQ = 10UL; /* default for QEMU; will be overwritten by FDT */
+unsigned long UART_PLIC_IRQ = 42UL; /* default for QEMU; will be overwritten by FDT */
 // UART 這個裝置 在 PLIC 裡面對應的 interrupt 編號
 // OrangePi: sys_int_ap[42] -> UART0_int (K1 SoC User Manual p.117)
 // QEMU: 10
+extern void * allocate(size_t size);
+extern void free(void * ptr);
+extern void * slab_alloc(size_t size); // kmalloc
+extern void slab_free(void * ptr);
 extern struct page* alloc_pages(int order);
+extern void free_pages(struct page* p);
 extern struct page* mem_map;
 extern unsigned long buddy_memory_base;
 
@@ -206,6 +211,7 @@ struct timer_event {
 };
 
 static struct timer_event *timer_queue_head = NULL;
+static void free_timer_event(struct timer_event *ev);
 
 /* Shared payload for setTimeout callback. */
 struct timeout_info {
@@ -236,17 +242,55 @@ static unsigned long task_seq_gen = 0;
 
 static struct timeout_info timeout_info_pool[TIMEOUT_INFO_POOL_SIZE];
 static int timeout_info_idx = 0;
+static unsigned long next_sched_tick = 0;
+static unsigned long timer_time_slice = 0;
+
+static void timer_rearm(void) {
+    unsigned long now = rdtime();
+
+    if (timer_time_slice == 0) {
+        timer_time_slice = ticks_per_sec / 32;
+    }
+
+    if (next_sched_tick == 0) {
+        next_sched_tick = now + timer_time_slice;
+    }
+
+    while (next_sched_tick <= now) {
+        next_sched_tick += timer_time_slice;
+    }
+
+    sbi_set_timer(next_sched_tick);
+}
+
+static void timer_run_due_events(void) {
+    unsigned long now = rdtime();
+
+    while (timer_queue_head && timer_queue_head->expire_time <= now) {
+        struct timer_event *ev = timer_queue_head;
+        timer_queue_head = ev->next;
+
+        if (ev->callback) {
+            ev->callback(ev->arg);
+        }
+
+        free_timer_event(ev);
+        now = rdtime();
+    }
+}
 
 static void timer_init(void) {
-    // 從硬體 Generic Counter Register 讀取 tick frequency (SoC 8.2.4 p.124)
-    // unsigned long counter_base = 0xD5001000UL;
-    // volatile uint32_t *freq_reg = (volatile uint32_t *)(counter_base + 0x20);
-    // ticks_per_sec = *freq_reg;
-
     unsigned long now = rdtime();
-    unsigned long target = now + 2UL * ticks_per_sec; // 2 秒後
-    boot_time = now;
+    unsigned long time_slice = ticks_per_sec / 32;
 
+    boot_time = now;
+    timer_time_slice = time_slice;
+    next_sched_tick = now + time_slice;
+
+    sbi_set_timer(next_sched_tick);
+
+    // unsigned long target = now + 2UL * ticks_per_sec; // 2 秒後
+    // boot_time = now;
     // sbi_set_timer(target);
     // add_timer();
 
@@ -451,7 +495,8 @@ void add_timer(void (*callback)(void*), void* arg, unsigned long duration) {
         new_event->next = timer_queue_head;
         timer_queue_head = new_event;
         /* Reprogram hardware timer to earlier time */
-        sbi_set_timer(expire_time);
+        unsigned long target = (expire_time < next_sched_tick) ? expire_time : next_sched_tick;
+        sbi_set_timer(target);
     } else { // 新的 timer 比 head 晚
         struct timer_event *current = timer_queue_head;
         // 從 queue head 開始往後找 找到一個位置，讓新事件插在正確的排序位置
@@ -462,6 +507,26 @@ void add_timer(void (*callback)(void*), void* arg, unsigned long duration) {
         current->next = new_event;
     }
 }
+
+// --- 補上這段：自製 C 標準函式庫 ---
+
+void *memcpy(void *dest, const void *src, unsigned long n) {
+    char *d = (char *)dest;
+    const char *s = (const char *)src;
+    while (n--) {
+        *d++ = *s++;
+    }
+    return dest;
+}
+
+void *memset(void *s, int c, unsigned long n) {
+    char *p = (char *)s;
+    while (n--) {
+        *p++ = (char)c;
+    }
+    return s;
+}
+// ------------------------------------
 
 static int strcmp(const char *s1, const char *s2) {
     while (*s1 && (*s1 == *s2)) {
@@ -584,6 +649,9 @@ int exec(const char *filename) {
             unsigned long user_sp = user_stack + STACK_SIZE;
             unsigned long sstatus;
 
+            // struct task_struct *curr = get_current();
+            // curr->user_sp = user_sp;
+
             // 從 CSR sstatus 讀出目前的值，存到 C 變數 sstatus。
             // csrr a0, sstatus
             asm volatile("csrr %0, sstatus" : "=r"(sstatus));
@@ -696,6 +764,13 @@ void boot_time_task(void *arg) {
     // add_timer(boot_time_task, NULL, 2UL);
 }
 
+/* forward declarations */
+struct task_struct;
+struct task_struct* get_current(void);
+void syscall_handler(struct pt_regs *regs);
+void schedule(void);
+void check_signal(struct task_struct *task, struct pt_regs *regs);
+
 // lab4 basic exercise 1 跟 2 跟 3 都會到 do_trap 這邊處理
 // 所以在 do_trap 可能就要區分一下是哪一個
 void do_trap(struct pt_regs *regs) {
@@ -707,62 +782,42 @@ void do_trap(struct pt_regs *regs) {
     unsigned long cause_code = scause & 0xffUL; // 取 scause 的最低的 8 位
     // 如果 cause_code = 5 就代表是 timer interrupt
 
-    // riscv spec 4.1.8 p.747 Supervisor Cause Register
-    // scause = 5 代表 supervisor timer interrupt
-    if (is_interrupt && cause_code == 5UL) {// exercise 2: supervisor timer interrupt
-        unsigned long now = rdtime();
-        /* boot time printing moved to a scheduled task (boot_time_task)
-         * Top-half now only handles timer queue dequeueing and reprogramming.
-         */
-
-        /* Lab 4 Advanced Exercise 1: enqueue expired timer callbacks as tasks */
-        // Top-half
-        while (timer_queue_head && timer_queue_head->expire_time <= now) {
-            struct timer_event *expired = timer_queue_head;
-            timer_queue_head = expired->next;
-
-            if (expired->callback) {
-                add_task(expired->callback, expired->arg, 1);
-            }
-            
-            /* Free the expired timer event back to pool */
-            free_timer_event(expired);
+    if (is_interrupt) {
+        // riscv spec 4.1.8 p.747 Supervisor Cause Register
+        // scause = 5 代表 supervisor timer interrupt
+        if (cause_code == 5UL) { // exercise 2: supervisor timer interrupt
+            unsigned long now = rdtime();
+            unsigned long next_val = now + (ticks_per_sec / 32); 
+            sbi_set_timer(next_val);
+            // timer_rearm();            
+            schedule();
+        } else if (cause_code == 9UL) {
+            // riscv spec 4.1.8 p.747 Supervisor Cause Register
+            // 反正只要 scause_code = 9 就代表是 supervisor external interrupt (SEIP)
+            // 而 SEIP 一定是從 PLIC 來的
+            // 除了 software exception 跟 timer interrupt 其他都是從 PLIC 來的
+            uart_plic_handle_interrupt();
+            run_pending_tasks_in_interrupt();
+        }
+    } else {
+        if (regs->scause == 8UL) { // system call
+            regs->sepc += 4; // 這段是在處理「U-mode 的 ecall」後，避免無限重複 trap。
+            // sepc: 儲存發生 trap 當下的程式執行的位址
+            syscall_handler(regs);
         }
 
-        /* Advanced Exercise 2: execute tasks before leaving interrupt context. */
-        run_pending_tasks_in_interrupt(); // 
-        
-        /* Reprogram hardware timer to next event or default 2 seconds */
-        unsigned long next_target = timer_queue_head ? timer_queue_head->expire_time : (now + 2UL * ticks_per_sec);
-        sbi_set_timer(next_target);
-        return;
+        // uart_puts("=== S-Mode trap ===\n");
+        // uart_puts("scause: ");
+        // uart_hex(regs->scause);
+        // uart_puts("\n");
+        // uart_puts("sepc: ");
+        // uart_hex(regs->sepc);
+        // uart_puts("\n");
+        // uart_puts("stval: ");
+        // uart_hex(regs->stval);
+        // uart_puts("\n");
     }
-
-    // riscv spec 4.1.8 p.747 Supervisor Cause Register
-    // 反正只要 scause_code = 9 就代表是 supervisor external interrupt (SEIP)
-    // 而 SEIP 一定是從 PLIC 來的
-    // 除了 software exception 跟 timer interrupt 其他都是從 PLIC 來的
-    if (is_interrupt && cause_code == 9UL) { 
-        uart_plic_handle_interrupt();
-        run_pending_tasks_in_interrupt();
-        return;
-    }
-
-    uart_puts("=== S-Mode trap ===\n");
-    uart_puts("scause: ");
-    uart_hex(regs->scause);
-    uart_puts("\n");
-    uart_puts("sepc: ");
-    uart_hex(regs->sepc);
-    uart_puts("\n");
-    uart_puts("stval: ");
-    uart_hex(regs->stval);
-    uart_puts("\n");
-
-    if (regs->scause == 8UL) {
-        regs->sepc += 4; // 這段是在處理「U-mode 的 ecall」後，避免無限重複 trap。
-        // sepc: 儲存發生 trap 當下的程式執行的位址
-    }
+    check_signal(get_current(), regs);
 }
 
 void devicetree_early_init(void *fdt) {
@@ -937,29 +992,29 @@ void devicetree_early_init(void *fdt) {
 int priority_set[4];
 
 void p1_callback(){
-    uart_puts("P11 start\n");
-    uart_puts("P11 end\n");
+    uart_puts("P1 start\n");
+    uart_puts("P1 end\n");
 }
 
 void p3_callback(){
-    uart_puts("P33 start\n");
+    uart_puts("P3 start\n");
     add_task(p1_callback, NULL, priority_set[0]);
     add_timer(NULL, NULL, 0);
-    uart_puts("P33 end\n");
+    uart_puts("P3 end\n");
 }
 
 void p2_callback(){
-    uart_puts("P22 start\n");
+    uart_puts("P2 start\n");
     add_task(p3_callback, NULL, priority_set[2]);
     add_timer(NULL, NULL, 0);
-    uart_puts("P22 end\n");
+    uart_puts("P2 end\n");
 }
 
 void p4_callback(){
-    uart_puts("P44 start\n");
+    uart_puts("P4 start\n");
     add_task(p2_callback, NULL, priority_set[1]);
     add_timer(NULL, NULL, 0);
-    uart_puts("P44 end\n");
+    uart_puts("P4 end\n");
 }
 
 // p4 start
@@ -987,6 +1042,668 @@ void test_func(){
 
     add_task(p4_callback, NULL, priority_set[3]);
 }
+
+// =============================== Lab5: Basic Exercise 1 - Thread ===============================
+
+enum task_state {
+    TASK_RUNNING,
+    TASK_RUNNABLE,
+    TASK_ZOMBIE
+};
+
+struct task_struct {
+    struct thread_struct {
+        unsigned long ra; // return address, 
+        unsigned long sp; // stack pointer, 
+        unsigned long s[12];
+    } thread;
+    int pid;
+    enum task_state state;
+    unsigned long kernel_sp;
+    unsigned long user_sp;
+    unsigned long stack; // kernel stack
+    struct task_struct* next;
+    // Lab5 : Advance Exercise - POSIX Signal
+    void (*handlers[32])(); // map signal number to corresponding handler address
+    uint32_t pending_signals; // 紀錄目前等待處理的 signal
+    struct pt_regs saved_context; // the user context before signal interrupt
+    int is_handling_signal; // whether it is handling signal now
+    void *signal_stack_base;
+};
+
+static int nr_threads = 0;
+
+// Linear FIFO Queue
+struct task_queue {
+    struct task_struct* head;
+    struct task_struct* tail;
+};
+
+static struct task_queue run_queue = {0, 0};
+static struct task_queue zombie_queue = {0, 0};
+
+static void enqueue(struct task_queue* q, struct task_struct* task) {
+    task->next = 0; // 確保乾淨的尾巴
+    if (q->head == 0) {
+        q->head = task;
+        q->tail = task;
+    } else {
+        q->tail->next = task;
+        q->tail = task;
+    }
+}
+
+static struct task_struct* dequeue(struct task_queue* q) {
+    if (q->head == 0) {
+        return 0; // 空佇列
+    }
+    struct task_struct* task = q->head;
+    q->head = q->head->next;
+    
+    if (q->head == 0) {
+        q->tail = 0; // 拿完如果空了，Tail 也歸零
+    }
+    return task;
+}
+
+void remove_task_from_queue(struct task_queue* q, struct task_struct* target) {
+    struct task_struct* curr = q->head;
+    struct task_struct* prev = 0;
+    while (curr) {
+        if (curr == target) {
+            if (prev) prev->next = curr->next;
+            else q->head = curr->next;
+            
+            if (q->tail == curr) q->tail = prev;
+            return;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+}
+
+struct task_struct* thread_create(void (*threadfn)()) {
+    struct task_struct* task = allocate(sizeof(struct task_struct));
+    memset(task, 0, sizeof(struct task_struct));
+    task->pid = nr_threads++; // 從 0 開始一路往上
+    task->stack = (unsigned long)allocate(4096); // order = 0 (4KB) kernel stack
+    task->thread.ra = (unsigned long)threadfn; // switch_to (start.S) ret 會來讀 ra 的位址 然後跳到 ra 去執行
+    task->thread.sp = task->stack + STACK_SIZE; // kernel stack pointer
+    task->state = TASK_RUNNABLE;
+
+    task->user_sp = 0; // user stack pointer = 0, represent kernel thread
+    // 一開始建立的 thread 都會是 kernel thread
+    
+    enqueue(&run_queue, task); // 加入執行隊列尾端
+    return task;
+}
+
+// tp: 這個 register 會指向目前正在執行的 thread 的 pcb
+struct task_struct* get_current() {
+    register struct task_struct* current asm("tp");
+    return current;
+}
+
+extern void switch_to(struct task_struct* prev, struct task_struct* next);
+
+void schedule() {
+    struct task_struct* prev = get_current();
+    
+    // 如果 prev 還活著，就乖乖去隊伍最後面重新排隊
+    if (prev->state == TASK_RUNNING) {
+        prev->state = TASK_RUNNABLE;
+        enqueue(&run_queue, prev); 
+    }
+
+    // 從隊伍最前面請下一個人上台
+    struct task_struct* next = dequeue(&run_queue);
+    
+    // 如果沒人排隊，就繼續自己跑 (通常是 idle)
+    if (next == 0) {
+        prev->state = TASK_RUNNING;
+        return; 
+    }
+
+    next->state = TASK_RUNNING;
+
+    if (prev != next) {
+        // 區分 Kernel Thread 與 User Process
+        if (next->user_sp != 0) {
+            // 這是一個 User Program (例如 osctest.bin 或 fork 出來的)
+            // 它從 U-mode 發生 ecall/中斷時，需要切換到自己的 Kernel Stack
+            unsigned long next_kstack_top = next->stack + STACK_SIZE;
+            asm volatile("csrw sscratch, %0" : : "r"(next_kstack_top));        
+        } 
+        else {
+            // 這是一個 Kernel Thread (例如 foo, idle, shell)
+            // 它發生中斷時「已經」在 Kernel Stack 裡了，所以請 trap.S 不要交換 sp！
+            asm volatile("csrw sscratch, 0");
+        }
+        
+        switch_to(prev, next);
+    }
+}
+
+void thread_exit() {
+    struct task_struct* current = get_current();
+    current->state = TASK_ZOMBIE;
+
+    enqueue(&zombie_queue, current);
+
+    schedule();
+}
+
+struct task_struct* find_task_by_pid(long pid) {
+    struct task_struct* curr = run_queue.head;
+    while (curr) {
+        if (curr->pid == pid) return curr;
+        curr = curr->next;
+    }
+
+    curr = zombie_queue.head;
+    while (curr) {
+        if (curr->pid == pid) return curr;
+        curr = curr->next;
+    }
+    
+    return NULL; // 沒找到
+}
+
+void kill_zombies() {
+    struct task_struct* dead_task;
+    while ((dead_task = dequeue(&zombie_queue)) != 0) {
+        free((void *)dead_task->stack); 
+        free(dead_task);
+    }
+}
+
+void idle() {
+    while (1) {
+        // kill_zombies();
+        schedule();
+    }
+}
+
+void foo() { // lab 5: Basic Exercise 1 - Thread
+    asm volatile("csrsi sstatus, (1 << 1)");
+    for (int i = 0; i < 5; i++) {
+        uart_puts("Thread ID: ");
+        uart_hex(get_current()->pid);
+        uart_puts(" ");
+        uart_hex(i);
+        uart_puts("\n");
+        for (int j = 0; j < 100000000; j++); // round robin time
+        // schedule();
+    }
+    thread_exit();
+}
+
+// =============================== Lab5: Basic Exercise 2 - User Process and System Call  ===============================
+
+extern void ret_from_exception(); 
+
+long sys_getpid(void);
+long sys_uart_read(char *buf, long count);
+long sys_uart_write(const char *buf, long count);
+int  sys_exec(const char *path);
+long sys_fork(struct pt_regs *regs); // fork 需要 Trap Frame 來複製 context
+long sys_waitpid(long pid);
+void sys_exit(int status);
+int  sys_stop(long pid);
+
+/* Kernel shell exec uses spawn+wait semantics via this shared path buffer. */
+static char current_exec_path[128];
+
+static void run_user_program(void) {
+    if (exec(current_exec_path) < 0) {
+        uart_puts("Failed to exec user program.\n");
+        thread_exit();
+    }
+}
+
+// Lab5: Basic Exercise 3 - Video Player
+void sys_display(unsigned int *bmp_image, unsigned int width, unsigned int height);
+int sys_usleep(unsigned int usec);
+
+// Lab5: Advance Exercise - POSIX Signal
+long sys_signal(int signum, void (*handler)());
+void sys_sigreturn(struct pt_regs *regs);
+int sys_kill(int pid, int signum);
+
+void syscall_handler(struct pt_regs *regs) {
+    // The system call number is stored in a7.
+    unsigned long syscall_num = regs->a7;
+
+    switch (syscall_num) {
+        case 0: // getpid()
+            regs->a0 = sys_getpid();
+            break;
+
+        case 1: // uart_read(char *buf, long count)
+            // 參數在 a0, a1
+            regs->a0 = sys_uart_read((char *)regs->a0, (long)regs->a1);
+            break;
+
+        case 2: // uart_write(const char *buf, long count)
+            // 參數在 a0, a1
+            regs->a0 = sys_uart_write((const char *)regs->a0, (long)regs->a1);
+            break;
+
+        case 3: // exec(const char *path)
+            regs->a0 = sys_exec((const char *)regs->a0);
+            break;
+
+        case 4: // fork()
+            // fork 比較特別，需要目前的 regs 狀態來複製 context
+            regs->a0 = sys_fork(regs); 
+            break;
+
+        case 5: // waitpid(long pid)
+            regs->a0 = sys_waitpid((long)regs->a0);
+            break;
+
+        case 6: // exit(int status)
+            sys_exit((int)regs->a0);
+            // exit 通常不會 return
+            break;
+
+        case 7: // stop(long pid)
+            regs->a0 = sys_stop((long)regs->a0);
+            break;
+
+        case 8: // display(unsigned int *bmp_image, unsigned int width, unsigned int height)
+            sys_display((unsigned int *)regs->a0, (unsigned int)regs->a1, (unsigned int)regs->a2);
+            break;
+
+        case 9: // usleep(unsigned int usec)
+            regs->a0 = sys_usleep((unsigned int)regs->a0);
+            break;
+
+        case 10: // signal(int signum, void (*handler)())
+            regs->a0 = sys_signal((int)regs->a0, (void (*)())regs->a1);
+            break;
+
+        case 11: // sigreturn()
+            sys_sigreturn(regs); 
+            break;
+
+        case 12: // kill(int pid, int signum)
+            regs->a0 = sys_kill((int)regs->a0, (int)regs->a1);
+            break;
+
+        default:
+            uart_puts("Unknown System Call ID: ");
+            uart_hex(syscall_num);
+            uart_puts("\n");
+            regs->a0 = -1; // 傳回失敗
+            break;
+    }
+}
+
+long sys_getpid(void) {
+    return get_current()->pid;
+}
+
+long sys_uart_read(char *buf, long count) {
+    for (int i = 0; i < count; i++) {
+        char c = uart_getc();
+        buf[i] = c;
+        if (c == '\n' || c == '\r') {
+            return i + 1;
+        }
+    }
+    return count;
+}
+
+long sys_uart_write(const char *buf, long count) {
+    for (long i = 0; i < count; i++) {
+        uart_putc(buf[i]);
+    }
+    return count;
+}
+
+// uncheck
+int sys_exec(const char *path) {
+    // Return 0 on success, -1 on failure.
+    if (!cpio_base) return -1;
+
+    const char *ptr = (const char *)cpio_base;
+    while (1) {
+        const struct cpio_t *header = (const struct cpio_t *)ptr;
+        if (strncmp(header->magic, "070701", 6) != 0) break;
+
+        uint32_t namesize = (uint32_t)hextoi(header->namesize, 8);
+        uint32_t filesize = (uint32_t)hextoi(header->filesize, 8);
+        const char *cur_filename = ptr + sizeof(struct cpio_t);
+
+        if (!strcmp(cur_filename, "TRAILER!!!")) break;
+
+        uint32_t data_offset = (uint32_t)align(sizeof(struct cpio_t) + namesize, 4);
+
+        if (!strcmp(cur_filename, path)) { // 找到了
+            unsigned long target_address = (unsigned long)(ptr + data_offset);
+
+            struct page *user_stack_page = alloc_pages(0); // 4KB
+            if (!user_stack_page) return -1;
+
+            unsigned long user_stack = buddy_memory_base + (unsigned long)(user_stack_page - mem_map) * 4096UL;
+            unsigned long user_sp = user_stack + STACK_SIZE; // stack 是從上長到下
+
+            struct task_struct* curr = get_current();
+            // Trap Frame 位於 stack 頂端向下偏移 sizeof(pt_regs) 的位置
+            struct pt_regs* regs = (struct pt_regs*)(curr->stack + STACK_SIZE - sizeof(struct pt_regs));
+
+            regs->sepc = target_address;   // 轉生後的程式起跑點
+            regs->sp = user_sp;            // 轉生後的 User Stack
+
+            regs->sstatus &= ~(1UL << 8);  // 清除 SPP (第 8 bit), 硬體會自動把 「進來之前的模式」 紀錄在 SPP 這個位元裡
+            // 當核心執行完畢，準備呼叫 sret 指令跳出核心時，CPU 會去看 SPP 位元來決定 「跳出去之後要變成什麼模式」。
+            regs->sstatus |= (1UL << 5);   // 設定 SPIE (第 5 bit), 跳回 U-Mode 後，Interrupt Enable
+
+            // Return 0 on success, -1 on failure.
+            regs->a0 = 0;
+
+            curr->user_sp = user_sp; // 從 kernel thread 變成 user-space thread
+
+            return 0;
+        }
+        ptr += align(data_offset + filesize, 4);
+    }
+    uart_puts("sys_exec: file not found: ");
+    uart_puts(path);
+    uart_puts("\n");
+    return -1;
+}
+
+long sys_fork(struct pt_regs *regs) {
+    struct task_struct* parent = get_current();
+
+    struct task_struct* child = allocate(sizeof(struct task_struct));
+    memset(child, 0, sizeof(struct task_struct));
+    child->pid = nr_threads++;
+    child->stack = (unsigned long)allocate(4096); // 核心堆疊 (Kernel Stack)
+    child->state = TASK_RUNNABLE;
+
+    // copy parent thread's kernel stack
+    for (int i = 0; i < 4096; i++) {
+        ((char*)child->stack)[i] = ((char*)parent->stack)[i];
+    }
+
+    // 3. 重要：在 Lab 5 Basic 階段，必須複製 User Stack
+    // 如果不複製，父子行程會改到同一個 User Stack 的變數 (如 fork_test 裡的 cnt)
+    struct page *user_stack_page = alloc_pages(0);
+    unsigned long child_user_stack_base = buddy_memory_base + (unsigned long)(user_stack_page - mem_map) * 4096UL;
+    
+    unsigned long real_user_sp = regs->sp; 
+    unsigned long parent_user_stack_base = real_user_sp & ~0xFFFUL;
+
+    for (int i = 0; i < 4096; i++) {
+        ((char*)child_user_stack_base)[i] = ((char*)parent_user_stack_base)[i];
+    }
+
+    // 💡 關鍵修正 2：精準還原小孩的 sp 深度
+    // (real_user_sp & 0xFFFUL) 會算出手指頭離地板有多高
+    child->user_sp = child_user_stack_base + (real_user_sp & 0xFFFUL); // 0xFFF = 4KB, 向下對齊到 4KB
+
+    // Note that only processes forked after signal is called will inherit the handler.
+    /* Copy signal handlers from parent (inherit signal registrations) */
+    for (int i = 0; i < 32; i++) {
+        child->handlers[i] = parent->handlers[i];
+    }
+    child->pending_signals = 0;
+    child->is_handling_signal = 0;
+    child->signal_stack_base = 0;
+
+    // 4. 計算 Trap Frame 位址並設定醒來路徑
+    struct pt_regs* child_regs = (struct pt_regs*)(child->stack + STACK_SIZE - sizeof(struct pt_regs));
+
+    *child_regs = *regs; // 複製所有暫存器狀態
+
+    // 5. 設定回傳值與更新子行程的狀態
+    child_regs->a0 = 0;              // Return the child’s pid to the parent, and 0 to the child.
+    child_regs->sp = child->user_sp; // 更新 Trap Frame 裡的 sp 指向新 User Stack
+
+    child_regs->tp = (unsigned long)child; 
+
+    child->thread.ra = (unsigned long)ret_from_exception;
+    child->thread.sp = (unsigned long)child_regs;
+
+    enqueue(&run_queue, child);
+
+    return (long)child->pid; // Return the child’s pid to the parent, and 0 to the child.
+}
+
+long sys_waitpid(long pid) { // 不確定會不會跟 kill_zombies() 有問題？
+    while (1) {
+        struct task_struct* target = find_task_by_pid(pid);
+        if (target == NULL) return pid; 
+
+        if (target->state == TASK_ZOMBIE) {
+            remove_task_from_queue(&zombie_queue, target);
+
+            if (target->stack) {
+                free((void *)target->stack);
+            }
+            if (target->user_sp != 0) {
+                unsigned long user_stack_base = target->user_sp & ~0xFFFUL;
+                struct page *user_page = mem_map + ((user_stack_base - buddy_memory_base) / 4096UL);
+                free_pages(user_page);
+            }
+            free(target);
+            
+            return pid;
+        }
+
+        schedule();
+    }
+}
+
+void sys_exit(int status) {
+    struct task_struct* curr = get_current();
+
+    curr->state = TASK_ZOMBIE;
+    enqueue(&zombie_queue, curr);
+
+    schedule();
+}
+
+int sys_stop(long pid) {
+    struct task_struct* target = find_task_by_pid(pid);
+    if (target == NULL || target->state == TASK_ZOMBIE) return -1; 
+
+    target->state = TASK_ZOMBIE;
+    
+    remove_task_from_queue(&run_queue, target);
+    enqueue(&zombie_queue, target);
+    
+    return 0;
+}
+
+// =============================== Lab5: Basic Exercise 3 - Video Player  ===============================
+
+#define FB_BASE   0x7f700000
+#define FB_WIDTH  1920
+#define FB_HEIGHT 1080
+#define CACHE_BLOCK_SIZE 64
+
+#define cbo_flush(start)                \
+    ({                                  \
+        asm volatile("mv a0, %0\n\t"    \
+                     ".word 0x0025200F" \
+                     :                  \
+                     : "r"(start)       \
+                     : "memory", "a0"); \
+    })
+
+static void flush_dcache(void* addr, unsigned long len) {
+    unsigned long start = (unsigned long)addr & ~(CACHE_BLOCK_SIZE - 1);
+    __sync_synchronize(); // 確保前面的 memory 操作都完成了
+    for (unsigned long line = start; line < (unsigned long)addr + len; line += CACHE_BLOCK_SIZE) {
+        cbo_flush(line);
+        __sync_synchronize();
+    }
+}
+
+void sys_display(unsigned int *bmp_image, unsigned int width, unsigned int height) {
+    unsigned int *fb = (unsigned int *)FB_BASE;
+    
+    int start_x = (FB_WIDTH - width) / 2;
+    int start_y = (FB_HEIGHT - height) / 2;
+
+    // 逐行將影片像素搬運到 Framebuffer
+    for (int y = 0; y < height; y++) {
+        void *dst = fb + (start_y + y) * FB_WIDTH + start_x;
+        
+        memcpy(dst, bmp_image + y * width, width * sizeof(unsigned int));
+        
+        flush_dcache(dst, width * sizeof(unsigned int));
+    }
+}
+
+int sys_usleep(unsigned int usec) {
+    unsigned long start = rdtime();
+    unsigned long delta_ticks = (unsigned long)usec * (ticks_per_sec / 1000000);
+    unsigned long end = start + delta_ticks;
+
+    while (rdtime() < end) {
+        schedule(); 
+    }
+
+    return 0;
+}
+
+// =============================== Lab5: Advance Exercise - POSIX Signal  ===============================
+
+void check_signal(struct task_struct *task, struct pt_regs *regs) {
+    if (!task) return;
+
+    if (task->user_sp == 0) return; // only user threads
+
+    if (task->pending_signals == 0 || task->is_handling_signal) return;
+
+    int signum = -1;
+    for (int i = 0; i < 32; i++) {
+        if (task->pending_signals & (1UL << i)) {
+            signum = i;
+            break;
+        }
+    }
+    if (signum < 0) return;
+
+    uart_puts("[check_signal] PID ");
+    uart_hex(task->pid);
+    uart_puts(" signal ");
+    uart_hex(signum);
+    uart_puts(" handler=0x");
+    uart_hex((unsigned long)task->handlers[signum]);
+    uart_puts("\n");
+
+    if (task->handlers[signum] == NULL) {
+        uart_puts("No handler for signal, terminate process.\n");
+        
+        task->pending_signals &= ~(1UL << signum); // 移除標籤
+        
+        if (task == get_current()) sys_exit(0);
+        return;
+    }
+
+    /* save user context and prepare signal stack */
+    task->saved_context = *regs;
+
+    struct page *sig_page = alloc_pages(0);
+    if (!sig_page) return; // cannot deliver
+    task->signal_stack_base = (void *)sig_page;
+
+    unsigned long sig_base = buddy_memory_base + (unsigned long)(sig_page - mem_map) * 4096UL;
+    unsigned long sig_stack_top = sig_base + 4096UL;
+
+    /* write trampoline at the end of signal stack: addi a7, x0, 11; ecall */
+    unsigned int *tramp = (unsigned int *)(sig_stack_top - 8);
+    tramp[0] = 0x00B00893U; /* addi a7, x0, 11 (System Call Number) sigreturn */
+    tramp[1] = 0x00000073U; /* ecall */
+
+    /* place trampoline address on stack so handler's ret pops it as return address */
+    unsigned long *stack_return_addr = (unsigned long *)(sig_stack_top - 16);
+    *stack_return_addr = (unsigned long)(sig_stack_top - 8);
+
+    /* redirect execution to handler in user mode */
+    regs->sepc = (unsigned long)task->handlers[signum];
+    regs->sp = sig_stack_top - 16;  /* sp points to return address on stack */
+    regs->ra = (unsigned long)(sig_stack_top - 8);  /* ra also points to trampoline for safety */
+
+    uart_puts("[check_signal] handler sepc=0x");
+    uart_hex(regs->sepc);
+    uart_puts(" sp=0x");
+    uart_hex(regs->sp);
+    uart_puts(" ra=0x");
+    uart_hex(regs->ra);
+    uart_puts("\n");
+
+    task->is_handling_signal = 1;
+    task->pending_signals &= ~(1UL << signum);
+}
+
+long sys_signal(int signum, void (*handler)()) {
+    // system call 是 user program 求 Kernel 辦事
+    // signal 是 kernel 逼 user program 辦事
+    // 例如：平常在 linux ctrl + c 這是 SIGINT 會終止程式
+    // sys_signal() 本質上是讓 user program 去定義 哪一個 signal number 對應到哪一個 handler
+
+    if (signum < 0 || signum >= 32) return -1;
+    struct task_struct *curr = get_current();
+    curr->handlers[signum] = handler;
+    uart_puts("[sys_signal] PID ");
+    uart_hex(curr->pid);
+    uart_puts(" signal ");
+    uart_hex(signum);
+    uart_puts(" handler=0x");
+    uart_hex((unsigned long)handler);
+    uart_puts("\n");
+    return 0;
+}
+
+void sys_sigreturn(struct pt_regs *regs) {
+    // You must print a message in the sigreturn function to verify your implementation is correct. 
+    // The message should be printed every time a signal handler finishes.
+
+    struct task_struct *curr = get_current();
+    
+    uart_puts("sigreturn: restoring context for PID ");
+    uart_hex(curr->pid);
+    uart_puts("\n");
+
+    *regs = curr->saved_context;
+
+    // recycle signal handler's stack
+    if (curr->signal_stack_base) {
+        free_pages((struct page*)curr->signal_stack_base);
+        curr->signal_stack_base = 0;
+    }
+
+    curr->is_handling_signal = 0;
+}
+
+// SIGTERM
+int sys_kill(int pid, int signum) {
+    if (signum < 0 || signum >= 32) return -1;
+
+    struct task_struct *target = find_task_by_pid(pid);
+    if (!target) return -1;
+
+    uart_puts("[sys_kill] send signal ");
+    uart_hex(signum);
+    uart_puts(" to PID ");
+    uart_hex(pid);
+    uart_puts("\n");
+
+    target->pending_signals |= (1UL << signum);
+
+    if (target->state == TASK_ZOMBIE) return -1;
+
+    return 0;
+}
+
+// ======================================================================================================
 
 
 extern void mm_init(unsigned long base, unsigned long size);
@@ -1047,7 +1764,6 @@ void start_kernel(unsigned long hartid) {
     boot_cpu_hartid = hartid;
     // relocate_bootloader(boot_cpu_hartid);
     devicetree_early_init(fdt_ptr);
-    timer_init();
     /* initialize UART ring buffers before any UART I/O */
     // uart_buffer_init();
     // /* enable UART RX and TX interrupts at UART peripheral (PLIC not configured yet) */
@@ -1127,11 +1843,30 @@ void start_kernel(unsigned long hartid) {
     char buf[256];
     int idx = 0;
 
+    // ============ Lab5: Basic Exercise 1 - Thread ============
+
+    struct task_struct* shell_task = thread_create(idle);
+
+    shell_task->state = TASK_RUNNABLE; // 先設為 RUNNABLE
+    remove_task_from_queue(&run_queue, shell_task); // 把它從隊列抽出來
+    shell_task->state = TASK_RUNNING; // 宣告它正在執行
+
+    asm volatile("mv tp, %0" : : "r"(shell_task));
+
+    // for (int i = 0; i < 3; i++) {
+    //     thread_create(foo);
+    // }
+    // idle();
+
+    // =========================================================
+
+    timer_init();
+
     while (1) {
         uart_puts("opi-rv2> ");
         idx = 0;
         while (1) {
-            char c = uart_polling_getc();
+            char c = uart_getc();
 
             if (c == '\n') {
                 uart_putc('\n');
@@ -1248,8 +1983,16 @@ void start_kernel(unsigned long hartid) {
             if (*filename == '\0') {
                 uart_puts("Error: missing program name.\n");
             } else {
-                if (exec(filename) < 0) {
-                    uart_puts("Failed to exec user program.\n");
+                struct task_struct* child;
+
+                strncpy(current_exec_path, filename, sizeof(current_exec_path) - 1);
+                current_exec_path[sizeof(current_exec_path) - 1] = '\0';
+
+                child = thread_create(run_user_program);
+                if (!child) {
+                    uart_puts("Failed to create task for exec.\n");
+                } else {
+                    sys_waitpid(child->pid);
                 }
             }
         }
