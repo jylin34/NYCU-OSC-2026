@@ -1,0 +1,103 @@
+1. main.c:29 PLIC_BASE (QEMU: 0xc000000 OrangePi: 0xE0000000)
+2. main.c:31 UART_PLIC_IRQ (QEMU: 10 / OrangePi: 42)
+3. main.c:1718 PHYS_RAM_BASE (QEMU: 0x80000000 / OrangePi: 0x00000000)
+4. main.c:1721 UART_PHYS_BASE (QEMU: 0x10000000UL / OrangePi: 0xD4017000UL)
+5. uart.c:10 UART_BASE (QEMU: 0x10000000UL / OrangePi: 0xD4017000UL)
+6. uart.c:11 UART_LSR_OFFSET (QEMU: 0x5 / OrangePi: 0x14)
+7. uart.c:21 UART_IER (QEMU: 0x1 / OrangePi: 0x4)
+8. link.ld:15 (QEMU: 0x80200000 / OrangePi: 0x00200000)
+
+
+因為沒帶板子，也不太敢就在 QEMU 跑，所以這邊先盡可能列出要做的，禮拜天回宿舍的時候開始改。
+
+1. (Sun) 第一個問題就是現在是針對 identity map 開兩個總共 2GB 的 PMD，但是在 drop identity map 的時候，drop 第二個的時候會出事：
+
+=== S-Mode trap ===
+scause: 0x000000000000000f
+sepc: 0xffffffc000205e22
+stval: 0x000000007dd2e000
+
+就是因為在 main.c:2064 truct task_struct* shell_task = thread_create(idle);
+
+thread_create() 會去 allocate memory，這邊 allocate memory return 的 address 還是 physical address，所以基本上就是要把 mm.c 裡面
+所有位址相關的東西，都轉成 Virtual memory
+
+這個好了
+
+
+2. (Sun) Basic Exercise 2 - To isolate user processes, you should allocate a separate PGD for each user process.
+白話文：為了確保 A 程式的記憶體不會干擾到 B 程式（進程隔離），每當你呼叫 sys_exec 或 sys_fork 準備執行一個新的 User 程式時，你必須呼叫 allocate(4096) 給它一塊全新的記憶體，當作這個程式專屬的 第一層分頁表 (PGD)。
+你要做的事：
+在 task_struct 中新增一個指標（例如 unsigned long *pgd），並在建立進程時分配給它。
+
+
+
+3. (Sun) Basic exercise 2 - Map the User Space
+在 mm.c 實作 pagewalk(unsigned long va, unsigned long pa, unsigned long prot)
+再開啟 satp 之後，CPU 會自動做 table walk，但是不會幫你鋪路，也就是建立那些表格跟指向表格，
+pagewalk() 做的事情就是： 檢查這個 va -> pa 有沒有對應的路了，沒有的話幫她鋪路，建立表格
+eg. 如果在 pgd 沒有看到對應的 index，那就趕快 allocate 一塊 4096，當作他的 pmd table，如果在 pmd 找不到對應的，
+也會一樣 allocate 4096 給 pte 也是這樣。
+
+
+在 mm.c 實作 map_pages(unsigned long va, unsigned long size, unsigned long pa, unsigned long prot)
+基本上跟 pagewalk() 就是多了一個 input argument 叫做 size，這邊就是假設我們要處理一個比較大塊的 va map pa，也許總共有
+10 個 page 需要被 map，那原本沒有 map_pages() 我們要寫十次 pagewalk() ，反正基本上 man_pages() 裡面主要就是一個 for loop 每一次不斷呼叫 pagewalk()
+一個 for loop 每一次加上 4096 把加上後的 va map 到 pa
+
+這邊弄完 就是也要修好 exec 跟 sys_execp 的部分
+exec osctest.bin 要可以
+
+
+4. (Sun) Basic Exercise 2 - Revisit Syscalls
+反正這部分就是要我們重做 fork() 跟 exec()
+原本每產生一個新的 process 都要給他一個新的 address 的 stack 跟 memory space
+但是現在有 virtual address 可以做到 isoloation:
+程式 A 認為它住在 0x0 到 0x4000。
+程式 B 也認為它住在 0x0 到 0x4000。
+但在 MMU 的翻譯下：
+程式 A 的 0x0 其實指向實體位址 PA_A。
+程式 B 的 0x0 其實指向實體位址 PA_B。
+
+fork() 的部分 可以看看要不要直接實作 advance 3 的 CoW ?
+
+
+
+5. (一) Basic Exercise 2 - Context switch
+要改好 sys_fork() 跟 sys_exec() 
+To switch address spaces, write the process’s PGD to the satp register and flush TLB.
+就是當從 kernel 切換到一個 user program 的時候，就要換 satp 的 pgd address，原本 kernel 有自己的
+pgd ，現在 user process 會有自己的 pgd
+
+
+
+6. (一) Basic Exercise 2 - Video Player
+換 user_program bin 檔案，然後要確保 video 可以播放
+
+
+7. (二) Advanced Exercise 1 - Mmap
+void *mmap(void *addr, unsigned long length, int prot, int flags);
+新增一個叫做 mmap 的 system call 它是一個給 User 程式使用的系統呼叫（System Call）
+，用來跟核心說：「我需要一塊 連續的虛擬記憶體區間，請幫我準備好。」
+
+你的 Todo 清單：
+管理數據結構 (VMA List)：
+在 task_struct 裡面新增一個結構，用來記錄該行程目前擁有哪些 mmap 的區域。
+你需要記錄：(start_va, size, prot, flags)。
+處理 addr 參數的邏輯：
+如果 addr 是 NULL：你要去行程的虛擬位址空間裡掃描，找到一塊夠大的「空洞」。
+如果 addr 有給：你要先檢查那裡有沒有被佔用，如果沒被佔用就直接用。
+對齊與圓整 (Alignment)：
+length 如果不是 4KB 的倍數，要用 align_up 向上取整。
+處理 MAP_POPULATE：
+如果使用者傳了這個 flag，你不能只記錄 VMA，還要立刻呼叫你之前寫好的 map_pages，把實體頁面分配好並填入頁表。
+如果沒傳 MAP_POPULATE，你可以選擇實作 Demand Paging (請求分頁)：也就是先不分配實體頁面，等到 User 程式真的存取該位址觸發 Page Fault 時，才進去補位。
+
+Implement the mmap() system call. Syscall number: 13.
+You can verify your implementation with mmap_r (read test) or mmap_w (write test).
+
+8. (二) Advanced Exercise 2 - Page Fault Handler & Demand Paging
+
+
+
+9. Advanced Exercise 3 - Copy on Write
