@@ -1,4 +1,4 @@
-#define UART_BASE 0xffffffc010000000UL
+#define UART_BASE 0x10000000UL
 #define UART_RBR  (unsigned char*)(UART_BASE + 0x0)
 #define UART_THR  (unsigned char*)(UART_BASE + 0x0)
 #define UART_LSR  (unsigned char*)(UART_BASE + 0x5)
