@@ -1,0 +1,45 @@
+Basic Exercise 1
+open (/hello.txt)
+write 
+close
+open 
+read 
+close 
+
+Basic Exercise 2
+mkdir: 
+mkdir 
+open 
+write 
+open
+
+mount:
+mount 
+open 
+write 
+open 
+
+
+Basic Exercise 3
+lookup-1: 
+chdir 
+open 
+open 
+chdir 
+open 
+
+lookup-2:
+open
+read 
+close 
+
+## Basic Exercise 4: 唯讀檔案系統 (ramfs/initramfs)
+這裡助教預先準備了一個唯讀的 ramfs，裡面本來就有一些開機預載的檔案。
+讀取測試：0x0e (open) ➔ 0x10 (read) ➔ 0x0f (close)。助教去讀取一個 initramfs 裡本來就存在的檔案，看你能不能成功讀出。
+建立測試 (期待失敗)：0x0e (open) 嘗試在 ramfs 裡帶 O_CREAT 建立檔案。因為是唯讀，你的系統應該要回傳失敗。（因為你回傳失敗，符合助教預期，所以這關顯示 [PASS]！）
+寫入測試 (期待失敗)：0x0e (open) ➔ 0x11 (write) ➔ 0x0f (close)。嘗試對 ramfs 的檔案寫入，你應該要拒絕。（你的 code 沒拒絕，所以後續的讀寫測試就 [FAIL] 了）
+建立目錄測試 (期待失敗)：0x12 (mkdir) 嘗試在唯讀層建立目錄，你回傳失敗。（符合助教預期，[PASS]！）
+## Advanced Exercise 1: 標準輸入輸出 (stdin/stdout)
+測試 fd=0 (stdin) 和 fd=1 (stdout) 的硬體關聯。
+0x10 (read)：對 fd=0 進行 read。助教此時會要求你按下鍵盤上的 'x'，系統應該要卡住等待輸入，並成功讀到 'x'。
+0x11 (write)：對 fd=1 進行 write，測試能不能把字串透過 UART 印到畫面上。
